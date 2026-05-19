@@ -2,9 +2,10 @@ apiVersion: tekton.dev/v1
 kind: PipelineRun
 metadata:
   annotations:
-    build.appstudio.openshift.io/repo: https://github.com/netobserv/netobserv-cli?rev={{revision}}
+    build.appstudio.openshift.io/repo: https://github.com/openshift/network-observability-cli?rev={{revision}}
     build.appstudio.redhat.com/commit_sha: '{{revision}}'
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/cancel-in-progress: "true"
     pipelinesascode.tekton.dev/max-keep-runs: "3"
     # switch comment in/out at branch cut / release
     pipelinesascode.tekton.dev/on-cel-expression: |
@@ -26,7 +27,6 @@ metadata:
         "vendor/***".pathChanged()
       )
     # pipelinesascode.tekton.dev/on-cel-expression: "false"
-  creationTimestamp: null
   labels:
     appstudio.openshift.io/application: netobserv-ystream
     appstudio.openshift.io/component: network-observability-cli-ystream
