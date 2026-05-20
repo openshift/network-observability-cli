@@ -29,7 +29,7 @@ jobs:
         run: USER=netobserv VERSION=${{ env.short_sha }} make commands
       - name: upload commands
         id: artifact-upload-step
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: commands
           path: build/
@@ -39,7 +39,7 @@ jobs:
           echo ${{ env.short_sha }} > ./out/short-sha
           echo ${{ steps.artifact-upload-step.outputs.artifact-url }} > ./out/commands-url
       - name: upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pr
           path: out/
