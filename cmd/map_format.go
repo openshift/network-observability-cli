@@ -10,7 +10,7 @@ import (
 
 	"github.com/jpillora/sizestr"
 	"github.com/netobserv/flowlogs-pipeline/pkg/config"
-	ovnutils "github.com/netobserv/netobserv-ebpf-agent/pkg/utils"
+	"github.com/netobserv/netobserv-ebpf-agent/pkg/utils/networkevents"
 )
 
 const (
@@ -560,7 +560,7 @@ func toColValue(genericMap config.GenericMap, id string, width int) string {
 	case "TimeFlowRttMs":
 		outputStr = toDuration(genericMap, fieldName, time.Nanosecond)
 	case "NetworkEvents":
-		events := ovnutils.NetworkEventsToStrings(genericMap)
+		events := networkevents.MapToStrings(genericMap)
 		outputStr = strings.Join(events, ", ")
 	default:
 		// else simply pick field value as text from column name
