@@ -6,7 +6,7 @@ require (
 	github.com/gdamore/tcell/v2 v2.13.10
 	github.com/gopacket/gopacket v1.7.1
 	github.com/jpillora/sizestr v1.0.0
-	github.com/mattn/go-sqlite3 v1.14.48
+	github.com/mattn/go-sqlite3 v1.14.52
 	github.com/navidys/tvxwidgets v0.14.0
 	github.com/netobserv/flowlogs-pipeline v1.12.0-community
 	github.com/netobserv/netobserv-ebpf-agent v1.12.0-community
@@ -91,7 +91,7 @@ require (
 	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
-	google.golang.org/grpc v1.83.1 // indirect
+	google.golang.org/grpc v1.83.2 // indirect
 	google.golang.org/protobuf v1.36.12
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect
