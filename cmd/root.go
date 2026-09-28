@@ -82,6 +82,10 @@ func init() {
 		log.Info("Received SIGTERM; cleaning up...")
 		stopReceived = true
 
+		// Persist any buffered packet capture data before exiting; os.Exit
+		// skips deferred flushes, which would otherwise truncate the pcapng.
+		flushActivePacketWriter()
+
 		os.Exit(0)
 	}()
 
@@ -110,7 +114,7 @@ func onInit() {
 	printBanner()
 
 	log.Infof("Log level: %s\nOption(s): %s", logLevel, options)
-	if strings.Contains(options, "background") && !strings.Contains(options, "background=false") {
+	if optionEnabled("background") {
 		isBackground = true
 		log.Infof("Running in background mode")
 	}
@@ -192,6 +196,24 @@ func onLimitReached() bool {
 	}
 
 	return shouldExit
+}
+
+// optionEnabled reports whether a named CLI option is set in the pipe-separated --options string.
+// The shell passes flags as --name or name=true.
+func optionEnabled(name string) bool {
+	for _, part := range strings.Split(options, "|") {
+		part = strings.TrimSpace(part)
+		part = strings.TrimPrefix(part, "--")
+		key, val, hasVal := strings.Cut(part, "=")
+		if key != name {
+			continue
+		}
+		if hasVal {
+			return val != "false"
+		}
+		return true
+	}
+	return false
 }
 
 // Create output file, preventing path traversal
