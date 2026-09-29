@@ -1,4 +1,4 @@
-FROM docker.io/fedora:40
+FROM docker.io/fedora:46
 
 RUN dnf install -y nginx \
     && dnf clean all \
