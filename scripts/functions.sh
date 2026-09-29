@@ -19,6 +19,9 @@ if [ -z "${dateName+x}" ]; then dateName="$(date +"%Y_%m_%d_%I_%M")"; fi
 # force skipping cleanup
 skipCleanup=false
 
+# TLS enabled on OpenShift
+tlsEnabled=false
+
 # get either oc (favorite) or kubectl paths
 # this is used only when calling commands directly
 # else it will be overridden by inject.sh
@@ -49,6 +52,10 @@ command=""
 options=""
 manifest=""
 nodeSelector=""
+
+# finalized agent manifest, captured by setup() and applied later (after the collector is ready)
+# when TLS is enabled, so the resolve-tls initContainer can write the TLS ConfigMap first
+agentManifest=""
 
 OUTPUT_PATH="./output"
 YAML_OUTPUT_FILE="capture.yml"
@@ -152,6 +159,37 @@ function setMetricsPipelineConfig() {
   "$YQ_BIN" e --inplace " .spec.template.spec.containers[0].env[] |= select(.name == \"FLP_CONFIG\").value |= ($metricsPipelineConfigJSON | tojson)" "$1"
 }
 
+function enableCollectorTLS() {
+  # Add CA volume and mount to DaemonSet for FLP client TLS
+  "$YQ_BIN" e --inplace '.spec.template.spec.containers[0].volumeMounts += [{"name":"collector-ca","mountPath":"/etc/collector-ca","readOnly":true}]' "$manifest"
+  "$YQ_BIN" e --inplace '.spec.template.spec.volumes += [{"name":"collector-ca","configMap":{"name":"collector-ca"}}]' "$manifest"
+
+  # Honor the cluster TLS security profile: the FLP client reads TLS_MIN_VERSION/TLS_CIPHER_SUITES/
+  # TLS_CURVE_PREFERENCES from the collector-tls-config ConfigMap (written by the resolve-tls
+  # initContainer on the collector). optional:false so a missing ConfigMap fails loudly instead of
+  # silently downgrading TLS.
+  "$YQ_BIN" e --inplace '.spec.template.spec.containers[0].envFrom += [{"configMapRef":{"name":"collector-tls-config","optional":false}}]' "$manifest"
+
+  # Add TLS config to FLP pipeline grpc write
+  copyFLPConfig "$manifest"
+  sendIndex=$("$YQ_BIN" e -oj ".parameters[] | select(.name==\"send\") | path | .[-1]" "$json")
+  "$YQ_BIN" e -oj --inplace ".parameters[$sendIndex].write.grpc.tls = {\"caCertPath\":\"/etc/collector-ca/service-ca.crt\"}" "$json"
+  updateFLPConfig "$json" "$manifest"
+
+  # Annotate collector service for cert generation
+  collectorServiceYAML=$(echo "$collectorServiceYAML" | "$YQ_BIN" e '.metadata.annotations."service.beta.openshift.io/serving-cert-secret-name" = "collector-tls"' -)
+}
+
+function createCAConfigMap() {
+  applyYAML "apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: collector-ca
+  namespace: $namespace
+  annotations:
+    service.beta.openshift.io/inject-cabundle: \"true\""
+}
+
 function clusterIsReady() {
   ready=$(${K8S_CLI_BIN} get all 2>&1 | grep -c "Unable to connect")
   if [[ "${ready}" -gt 0 ]]; then
@@ -162,10 +200,14 @@ function clusterIsReady() {
 }
 
 function checkClusterVersion() {
+  # isOCP is a global consumed later (e.g. to enable collector TLS): default to false and flip it to
+  # true once we confirm we're talking to an OpenShift cluster.
+  isOCP=false
   states=$(${K8S_CLI_BIN} get clusterversion version -o jsonpath='{.status.history[*].state}')
   if [[ -z "${states}" ]]; then
     echo "Can't check version since cluster is not OpenShift"
-  else 
+  else
+    isOCP=true
     versions=$(${K8S_CLI_BIN} get clusterversion version -o jsonpath='{.status.history[*].version}')
     version=""
 
@@ -367,6 +409,13 @@ function setup() {
     YAML_OUTPUT_FILE="${command}_capture_${dateName}.yml"
   fi
 
+  # Enable TLS on OpenShift for collector-based captures
+  if [[ "$outputYAML" == "false" && "$isOCP" == "true" ]] && [[ "$command" = "flows" || "$command" = "packets" ]]; then
+    tlsEnabled=true
+    echo "OpenShift detected, enabling TLS for collector"
+    enableCollectorTLS
+  fi
+
   if [[ "$outputYAML" == "false" && -n "$nodeSelector" ]]; then
     getNodesByLabel "$nodeSelector"
   fi
@@ -378,13 +427,18 @@ function setup() {
   echo "creating service account"
   applyYAML "$saYAML"
 
-  if [ "$command" = "flows" ]; then
+  # Flows and packets captures both rely on the collector service (and its CA configmap when TLS is on)
+  if [[ "$command" = "flows" || "$command" = "packets" ]]; then
     echo "creating collector service"
     applyYAML "$collectorServiceYAML"
+    if [[ "$tlsEnabled" == "true" ]]; then
+      echo "creating CA configmap for TLS"
+      createCAConfigMap
+    fi
+  fi
+  if [ "$command" = "flows" ]; then
     echo "creating flow-capture agents"
   elif [ "$command" = "packets" ]; then
-    echo "creating collector service"
-    applyYAML "$collectorServiceYAML"
     echo "creating packet-capture agents"
   elif [ "$command" = "metrics" ]; then
     echo "creating service monitor"
@@ -393,11 +447,21 @@ function setup() {
   fi
 
   yaml="$(cat "$manifest")"
+  rm -rf "${MANIFEST_OUTPUT_PATH}"
+
+  # When TLS is enabled, defer agent deployment: the agents consume the collector-tls-config
+  # ConfigMap (envFrom, optional:false), which only exists after the collector's resolve-tls
+  # initContainer runs. commands/netobserv applies "$agentManifest" once the collector is ready.
+  if [[ "$tlsEnabled" == "true" ]]; then
+    # shellcheck disable=SC2034 # consumed by commands/netobserv after the collector is ready
+    agentManifest="$yaml"
+    return
+  fi
+
   applyYAML "$yaml"
   if [[ "$outputYAML" == "false" ]]; then
     waitDaemonset
   fi
-  rm -rf "${MANIFEST_OUTPUT_PATH}"
 }
 
 function follow() {
@@ -473,7 +537,11 @@ function cleanup() {
       copyOutput
     elif [ "$copy" = "prompt" ]; then
       while true; do
-        read -rp "Copy the capture output locally? [yes/no] " yn
+        if ! read -rp "Copy the capture output locally? [yes/no] " yn; then
+          # EOF (e.g. non-interactive stdin): skip copy rather than looping forever.
+          echo "copy skipped"
+          break
+        fi
         case $yn in
         [Yy]*)
           copyOutput
@@ -620,6 +688,31 @@ function edit_manifest() {
     ;;
   "ipsec_enable")
     "$YQ_BIN" e --inplace ".spec.template.spec.containers[0].env[] |= select(.name==\"ENABLE_IPSEC_TRACKING\").value|=\"$2\"" "$manifest"
+    ;;
+  "openssl_enable")
+    "$YQ_BIN" e --inplace ".spec.template.spec.containers[0].env[] |= select(.name==\"ENABLE_OPENSSL_TRACKING\").value|=\"$2\"" "$manifest"
+    ;;
+  "tls_plaintext_min_bytes")
+    "$YQ_BIN" e --inplace ".spec.template.spec.containers[0].env[] |= select(.name==\"TLS_PLAINTEXT_MIN_BYTES\").value|=\"$2\"" "$manifest"
+    ;;
+  "tls_plaintext_preview_bytes")
+    "$YQ_BIN" e --inplace ".spec.template.spec.containers[0].env[] |= select(.name==\"TLS_PLAINTEXT_PREVIEW_BYTES\").value|=\"$2\"" "$manifest"
+    ;;
+  "tls_process_allowlist")
+    "$YQ_BIN" e --inplace ".spec.template.spec.containers[0].env[] |= select(.name==\"TLS_PLAINTEXT_PROCESS_ALLOWLIST\").value|=\"$2\"" "$manifest"
+    ;;
+  "tls_host_mounts")
+    if [[ "$("$YQ_BIN" e '[.spec.template.spec.volumes[] | select(.name == "host-usr")] | length' "$manifest")" == "0" ]]; then
+      "$YQ_BIN" e --inplace '.spec.template.spec.volumes += [{"name":"host-usr","hostPath":{"path":"/usr","type":"Directory"}},{"name":"host-lib","hostPath":{"path":"/lib","type":"Directory"}},{"name":"host-lib64","hostPath":{"path":"/lib64","type":"Directory"}}]' "$manifest"
+      "$YQ_BIN" e --inplace '.spec.template.spec.containers[0].volumeMounts += [{"name":"host-usr","mountPath":"/host/usr","readOnly":true},{"name":"host-lib","mountPath":"/host/lib","readOnly":true},{"name":"host-lib64","mountPath":"/host/lib64","readOnly":true}]' "$manifest"
+    fi
+    "$YQ_BIN" e --inplace '.spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem = false' "$manifest"
+    if [[ "$("$YQ_BIN" e '.spec.template.spec.containers[0].securityContext.capabilities.add[] | select(. == "SYS_PTRACE")' "$manifest")" != "SYS_PTRACE" ]]; then
+      "$YQ_BIN" e --inplace '.spec.template.spec.containers[0].securityContext.capabilities.add += ["SYS_PTRACE"]' "$manifest"
+    fi
+    ;;
+  "host_pid")
+    "$YQ_BIN" e --inplace ".spec.template.spec.hostPID|=$2" "$manifest"
     ;;
   "privileged")
     "$YQ_BIN" e --inplace ".spec.template.spec.containers[0].securityContext.allowPrivilegeEscalation|=$2" "$manifest"
@@ -837,6 +930,187 @@ function waitDaemonset(){
 }
 
 # Validate options and edit manifest accordingly
+function option_basename() {
+  local key="${1%%=*}"
+  echo "${key#--}"
+}
+
+function option_enabled_flag() {
+  local option="$1"
+  local key="${option%%=*}"
+  local value="${option#*=}"
+  if [[ "$key" == "$value" ]]; then
+    return 0
+  fi
+  [[ "$value" == "true" ]]
+}
+
+function has_plaintext_pid_scope() {
+  for option in "${options[@]}"; do
+    case "$(option_basename "$option")" in
+    peer_ip|peer_cidr|tls_process_allowlist)
+      local value="${option#*=}"
+      if [[ -n "$value" && "${option%%=*}" != "$value" ]]; then
+        return 0
+      fi
+      ;;
+    esac
+  done
+  return 1
+}
+
+function plaintext_capture_flag_enabled() {
+  local flag="$1"
+  for option in "${options[@]}"; do
+    case "$(option_basename "$option")" in
+    "$flag")
+      if option_enabled_flag "$option"; then
+        return 0
+      fi
+      ;;
+    esac
+  done
+  return 1
+}
+
+function openssl_capture_enabled() {
+  plaintext_capture_flag_enabled enable_openssl
+}
+
+function has_port_filter() {
+  for option in "${options[@]}"; do
+    case "$(option_basename "$option")" in
+    port|dport|sport|ports|dports|sports|port_range|dport_range|sport_range)
+      local value="${option#*=}"
+      if [[ -n "$value" && "${option%%=*}" != "$value" ]]; then
+        return 0
+      fi
+      ;;
+    esac
+  done
+  return 1
+}
+
+function plaintext_port_filter_label() {
+  for option in "${options[@]}"; do
+    case "$(option_basename "$option")" in
+    port|dport|sport|ports|dports|sports|port_range|dport_range|sport_range)
+      local key
+      key="$(option_basename "$option")"
+      local value="${option#*=}"
+      if [[ -n "$value" && "${option%%=*}" != "$value" ]]; then
+        echo "${key}=${value}"
+        return
+      fi
+      ;;
+    esac
+  done
+}
+
+function plaintext_peer_scope_label() {
+  for option in "${options[@]}"; do
+    case "$(option_basename "$option")" in
+    peer_ip)
+      local value="${option#*=}"
+      if [[ -n "$value" && "${option%%=*}" != "$value" ]]; then
+        echo "peer_ip=${value}"
+        return
+      fi
+      ;;
+    peer_cidr)
+      local value="${option#*=}"
+      if [[ -n "$value" && "${option%%=*}" != "$value" ]]; then
+        echo "peer_cidr=${value}"
+        return
+      fi
+      ;;
+    tls_process_allowlist)
+      local value="${option#*=}"
+      if [[ -n "$value" && "${option%%=*}" != "$value" ]]; then
+        echo "process=${value}"
+        return
+      fi
+      ;;
+    esac
+  done
+}
+
+function confirm_tls_decryption_legal() {
+  if [[ "$command" != "packets" ]]; then
+    return
+  fi
+  if ! plaintext_capture_flag_enabled enable_openssl; then
+    return
+  fi
+  echo >&2
+  echo "WARNING: TLS decryption exposes encrypted traffic in plain text. In some" >&2
+  echo "         jurisdictions, capturing others' communications may be prohibited" >&2
+  echo "         without consent. Make sure this is legally permitted before proceeding." >&2
+  echo >&2
+  # non-interactive runs (e2e) skip the prompt
+  if [[ "$isE2E" = true ]]; then
+    return
+  fi
+  while true; do
+    if ! read -rp "Continue? [yes/no] " yn; then
+      # EOF (e.g. non-interactive stdin): abort rather than looping forever.
+      echo "Capture aborted."
+      exit 1
+    fi
+    case $yn in
+    [Yy]*) break ;;
+    [Nn]*)
+      echo "Capture aborted."
+      exit 1
+      ;;
+    *) echo "Please answer yes or no." ;;
+    esac
+  done
+}
+
+function warn_plaintext_peer_scope() {
+  if [[ "$command" != "packets" ]]; then
+    return
+  fi
+  local openssl=0
+  plaintext_capture_flag_enabled enable_openssl && openssl=1
+  if [[ $openssl -eq 0 ]]; then
+    return
+  fi
+
+  local peer_scope=0 port_filter=0
+  has_plaintext_pid_scope && peer_scope=1
+  has_port_filter && port_filter=1
+
+  if [[ $peer_scope -eq 1 || $port_filter -eq 1 ]]; then
+    local scope_parts=()
+    if [[ $peer_scope -eq 1 ]]; then
+      scope_parts+=("$(plaintext_peer_scope_label)")
+    fi
+    if [[ $port_filter -eq 1 ]]; then
+      scope_parts+=("$(plaintext_port_filter_label)")
+    fi
+    local IFS=', '
+    echo "Plaintext capture scoped to ${scope_parts[*]}."
+  fi
+
+  if [[ $peer_scope -eq 0 ]]; then
+    echo >&2
+    echo "Warning: TLS plaintext capture has no --peer_ip or --peer_cidr scope." >&2
+    if [[ $openssl -eq 1 ]]; then
+      echo "  --enable_openssl: hooks libssl.so in every container on each node (infra binaries excluded)." >&2
+    fi
+    echo "                    Recommended: --peer_ip=<pod-ip> to limit which processes are hooked." >&2
+    echo >&2
+  fi
+
+  if [[ $port_filter -eq 0 ]]; then
+    echo "Warning: TLS plaintext capture has no --port (or --dport) filter." >&2
+    echo "          Recommended: --port=<service-port> to filter exported plaintext and wire capture." >&2
+    echo >&2
+  fi
+}
+
 function parse_args() {
   # Iterate through the command-line arguments
   for option in "${options[@]}"; do
@@ -1022,6 +1296,63 @@ function parse_args() {
         echo "invalid value for --enable_all"
       fi
       ;;
+    *enable_openssl) # OpenSSL plaintext capture via libssl uprobes
+      if [[ "$command" == "packets" ]]; then
+        defaultValue "true"
+        if [[ "$value" == "true" ]]; then
+          edit_manifest "privileged" "$value"
+          edit_manifest "host_pid" "$value"
+          edit_manifest "tls_host_mounts" ""
+          edit_manifest "openssl_enable" "$value"
+        elif [[ "$value" == "false" ]]; then
+          echo
+        else
+          echo "invalid value for --enable_openssl"
+        fi
+      else
+        echo "--enable_openssl is invalid option for $command"
+        exit 1
+      fi
+      ;;
+    *tls_plaintext_min_bytes) # Drop short TLS plaintext events before agent export
+      if [[ "$command" == "packets" ]]; then
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+          edit_manifest "tls_plaintext_min_bytes" "$value"
+        else
+          echo "invalid value for --tls_plaintext_min_bytes (non-negative integer required)"
+          exit 1
+        fi
+      else
+        echo "--tls_plaintext_min_bytes is invalid option for $command"
+        exit 1
+      fi
+      ;;
+    *tls_plaintext_preview_bytes) # PlaintextPreview length on exported events
+      if [[ "$command" == "packets" ]]; then
+        if [[ "$value" =~ ^[0-9]+$ ]]; then
+          edit_manifest "tls_plaintext_preview_bytes" "$value"
+        else
+          echo "invalid value for --tls_plaintext_preview_bytes (non-negative integer required; 0 = full payload)"
+          exit 1
+        fi
+      else
+        echo "--tls_plaintext_preview_bytes is invalid option for $command"
+        exit 1
+      fi
+      ;;
+    *tls_process_allowlist) # Restrict TLS plaintext uprobes to named processes (comma-separated)
+      if [[ "$command" == "packets" ]]; then
+        if [[ -n "$value" ]]; then
+          edit_manifest "tls_process_allowlist" "$value"
+        else
+          echo "invalid value for --tls_process_allowlist (comma-separated process names required)"
+          exit 1
+        fi
+      else
+        echo "--tls_process_allowlist is invalid option for $command"
+        exit 1
+      fi
+      ;;
     *privileged) # Force privileged mode
       defaultValue "true"
       if [[ "$value" == "true" ]]; then
@@ -1176,6 +1507,9 @@ function parse_args() {
       ;;
     esac
   done
+
+  warn_plaintext_peer_scope
+  confirm_tls_decryption_legal
 
   # avoid packet capture without filters
   if [[ "$command" = "packets" ]]; then

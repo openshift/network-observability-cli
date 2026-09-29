@@ -2,7 +2,7 @@ ARG BUILDVERSION
 ARG BUILDVERSION_Y
 
 # Build the manager binary
-FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:v1.25 AS builder
+FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:v1.26 AS builder
 ARG BUILDVERSION
 ARG IMAGE=registry.redhat.io/network-observability/network-observability-cli-rhel9:${BUILDVERSION}
 ARG AGENT_IMAGE=registry.redhat.io/network-observability/network-observability-ebpf-agent-rhel9:${BUILDVERSION}
@@ -34,7 +34,7 @@ RUN USER=netobserv VERSION="$BUILDVERSION" IMAGE="$IMAGE" AGENT_IMAGE="$AGENT_IM
 RUN mkdir -p output
 
 # Create final image from ubi-minimal + built binary and command
-FROM registry.access.redhat.com/ubi9/ubi-minimal:9.8-1777460003
+FROM registry.redhat.io/ubi9/ubi-minimal-pqc:9.8-1790215907
 ARG BUILDVERSION
 ARG BUILDVERSION_Y
 
