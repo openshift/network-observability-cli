@@ -150,6 +150,13 @@ This will write [pcapng](https://wiki.wireshark.org/Development/PcapNg) into a s
 
 We use the pcapng format to add contextual metadata, such as the k8s pods and service names.
 
+With `--enable_openssl`, the CLI correlates plaintext events with wire packets
+using tuples, endpoints, direction, timing, payload and capture filters. Complete
+kernel-captured tuples are deterministic; partial or legacy records use
+conservative heuristics and may remain unannotated (`PcapAnnotated: false`) when
+the match is ambiguous. An annotation identifies the connection, not an exact
+plaintext-to-packet byte mapping.
+
 ### Metrics dashboard (OpenShift only)
 
 For instance, to capture many available metrics, including Packet drops, DNS stats and latenties:

@@ -2,17 +2,15 @@ package cmd
 
 import (
 	"bufio"
+	"context"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/pcapgo"
 	"github.com/jpillora/sizestr"
@@ -44,6 +42,7 @@ func init() {
 func runPacketCapture(_ *cobra.Command, _ []string) {
 	capture = Packet
 	showCount = defaultFlowShowCount
+	keepCount = defaultKeepCount
 	clearPacketCaptureBuffers()
 	if isBackground {
 		go backgroundHearbeat()
@@ -51,10 +50,25 @@ func runPacketCapture(_ *cobra.Command, _ []string) {
 	} else {
 		go startPacketCollector()
 		createFlowDisplay()
+		// Interactive UI exit is a normal return path, so stop the collector
+		// explicitly and wait for its pending plaintext/PCAP buffers to flush.
+		stopActivePacketCapture()
 	}
 }
 
 func startPacketCollector() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	completed := false
+	// Announce completion only after deferred buffer/file flushes have run.
+	defer func() {
+		if completed {
+			onLimitReached()
+		}
+	}()
+
 	if len(filename) > 0 {
 		log.Infof("Starting Packet Capture for %s...", filename)
 	} else {
@@ -66,7 +80,8 @@ func startPacketCollector() {
 
 	f, err := createOutputFile("pcap", filename+".pcapng")
 	if err != nil {
-		log.Fatal(err)
+		log.Error(err)
+		return
 	}
 	defer f.Close()
 
@@ -92,7 +107,21 @@ func startPacketCollector() {
 	// process exits; without this the last buffered packet(s) are lost and the
 	// pcapng file ends with a truncated block ("unexpected EOF" on read).
 	setActivePacketWriter(ngw, f)
+	ngwMu.Lock()
+	activePacketStop = func() { cancel(); <-done }
+	ngwMu.Unlock()
 	defer clearActivePacketWriter()
+
+	var wireBuf *wirePacketBuffer
+	if plaintextCaptureEnabled() {
+		wireBuf = newWirePacketBuffer(ngw, plaintextCorrelationWindow, func(m config.GenericMap) {
+			enrichPlaintextForExport(&m)
+			if plaintextLog != nil {
+				writePlaintextJSONL(plaintextLog, &m)
+			}
+		}, parseCaptureFilters())
+		defer wireBuf.Close()
+	}
 
 	if tlsKeylogPath != "" {
 		if err := embedTLSKeylog(ngw, tlsKeylogPath); err != nil {
@@ -110,67 +139,82 @@ func startPacketCollector() {
 	log.Debug("Started collector")
 	collectorStarted = true
 
-	go func() {
-		<-utils.ExitChannel()
-		close(flowPackets)
-		collector.Close()
-	}()
-
-	for fp := range flowPackets {
-		if stopReceived {
+	defer collector.Close()
+	deadline := time.NewTimer(max(time.Duration(0), maxTime-currentTime().Sub(startupTime)))
+	defer deadline.Stop()
+	exit := utils.ExitChannel()
+	for {
+		var fp *genericmap.Flow
+		select {
+		case <-ctx.Done():
+			completed = true
 			return
+		case <-exit:
+			completed = true
+			return
+		case <-deadline.C:
+			log.Infof("Capture reached %s, exiting now...", maxTime)
+			completed = true
+			return
+		case fp = <-flowPackets:
 		}
-
 		genericMap := config.GenericMap{}
 		if err := json.Unmarshal(fp.GenericMap.Value, &genericMap); err != nil {
 			log.Error("Error while parsing json", err)
-			return
-		}
-
-		if isPlaintextRecord(genericMap) {
-			assignPlaintextPacketID(&genericMap)
-			enrichPlaintextForExport(&genericMap)
-			genericMap["PcapAnnotated"] = false
-			if plaintextLog != nil {
-				writePlaintextJSONL(plaintextLog, &genericMap)
-			}
 			continue
 		}
-
-		data, ok := genericMap["Data"]
-		if ok {
-			go AppendFlow(genericMap.Copy())
-			writePacketData(ngw, &genericMap, &data)
+		if isPlaintextRecord(genericMap) {
+			handlePlaintextRecord(genericMap, wireBuf, plaintextLog)
 		} else {
-			go AppendFlow(genericMap)
+			handleWirePacket(ngw, genericMap, wireBuf)
 		}
-
 		totalBytes += int64(len(fp.GenericMap.Value))
 		if totalBytes > maxBytes {
-			if exit := onLimitReached(); exit {
-				log.Infof("Capture reached %s, exiting now...", sizestr.ToString(maxBytes))
-				return
-			}
+			log.Infof("Capture reached %s, exiting now...", sizestr.ToString(maxBytes))
+			completed = true
+			return
 		}
-
-		now := currentTime()
-		if int(now.Sub(startupTime)) > int(maxTime) {
-			if exit := onLimitReached(); exit {
-				log.Infof("Capture reached %s, exiting now...", maxTime)
-				return
-			}
-		}
-
 		captureStarted = true
 	}
 }
 
-func plaintextCaptureEnabled() bool {
-	return optionEnabled("enable_openssl")
+func handlePlaintextRecord(genericMap config.GenericMap, wireBuf *wirePacketBuffer, plaintextLog io.Writer) {
+	id := assignPlaintextPacketID(&genericMap)
+	enrichPlaintextForExport(&genericMap)
+	go AppendFlow(genericMap.Copy())
+	if wireBuf != nil && plaintextTupleVerified(genericMap) {
+		wireBuf.HandlePlaintext(genericMap, id)
+		return
+	}
+	prepareUnmatchedPlaintext(&genericMap)
+	genericMap["PcapAnnotated"] = false
+	if plaintextLog != nil {
+		writePlaintextJSONL(plaintextLog, &genericMap)
+	}
 }
 
-// clearPacketCaptureBuffers is a no-op until wire/TUI correlation lands (NETOBSERV-2859).
-func clearPacketCaptureBuffers() {}
+func handleWirePacket(ngw *pcapgo.NgWriter, genericMap config.GenericMap, wireBuf *wirePacketBuffer) {
+	data, ok := genericMap["Data"]
+	if !ok {
+		go AppendFlow(genericMap)
+		return
+	}
+	go AppendFlow(genericMap.Copy())
+	if wireBuf != nil {
+		if err := wireBuf.Enqueue(genericMap, data.(string)); err != nil {
+			log.Error("failed to buffer wire packet", err)
+		}
+		return
+	}
+	writePacketData(ngw, &genericMap, &data)
+}
+
+func plaintextCaptureEnabled() bool {
+	// Only OpenSSL uprobes are implemented on the eBPF agent side today.
+	// GoTLS/kTLS tracking is not wired yet, so their flags do not enable
+	// plaintext capture (and wire correlation) in the CLI.
+	return optionEnabled("enable_openssl")
+}
 
 func isPlaintextRecord(m config.GenericMap) bool {
 	rt, ok := m["RecordType"].(string)
@@ -189,58 +233,14 @@ func writePlaintextJSONL(w io.Writer, m *config.GenericMap) {
 }
 
 func writePacketData(ngw *pcapgo.NgWriter, genericMap *config.GenericMap, data *interface{}) {
-	ts := time.Unix(int64((*genericMap)["Time"].(float64)), 0)
-
 	b, err := base64.StdEncoding.DecodeString((*data).(string))
 	if err != nil {
 		log.Error("Error while decoding data", err)
 		return
 	}
-	keys := make([]string, 0, len((*genericMap)))
-	for k := range *genericMap {
-		if k == "Time" || k == "Data" {
-			continue
-		}
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-
-	srcComment.WriteString("Source\n")
-	dstComment.WriteString("Destination\n")
-	commonComment.WriteString("Common\n")
-	for _, k := range keys {
-		id := toColID(k)
-		str := fmt.Sprintf("%s: %v\n", toColName(id, 0), toColValue((*genericMap), id, 0))
-		if strings.HasPrefix(k, "Src") {
-			srcComment.WriteString(str)
-		} else if strings.HasPrefix(k, "Dst") {
-			dstComment.WriteString(str)
-		} else {
-			commonComment.WriteString(str)
-		}
-	}
-
-	ngwMu.Lock()
-	err = ngw.WritePacketWithOptions(gopacket.CaptureInfo{
-		Timestamp:     ts,
-		Length:        len(b),
-		CaptureLength: len(b),
-	}, b, pcapgo.NgPacketOptions{
-		Comments: []string{
-			srcComment.String(),
-			dstComment.String(),
-			commonComment.String(),
-		},
-	})
-	ngwMu.Unlock()
-	if err != nil {
+	if err := writePacketDataWithOptions(ngw, genericMap, b, nil, nil); err != nil {
 		log.Error("Error while writing packet", err)
-		return
 	}
-
-	srcComment.Reset()
-	dstComment.Reset()
-	commonComment.Reset()
 }
 
 // ngwMu serializes all NgWriter writes (packets and TLS keylog DSB blocks) and
@@ -251,8 +251,9 @@ var keylogOffset int64
 // activeNgw / activePcapFile point at the in-flight packet capture output, if
 // any, so flushActivePacketWriter can persist buffered data on abrupt exit.
 var (
-	activeNgw      *pcapgo.NgWriter
-	activePcapFile *os.File
+	activeNgw        *pcapgo.NgWriter
+	activePcapFile   *os.File
+	activePacketStop func()
 )
 
 func setActivePacketWriter(ngw *pcapgo.NgWriter, f *os.File) {
@@ -267,6 +268,19 @@ func clearActivePacketWriter() {
 	defer ngwMu.Unlock()
 	activeNgw = nil
 	activePcapFile = nil
+	activePacketStop = nil
+}
+
+// stopActivePacketCapture waits for pending plaintext, PCAP and file flushes.
+func stopActivePacketCapture() bool {
+	ngwMu.Lock()
+	stop := activePacketStop
+	ngwMu.Unlock()
+	if stop == nil {
+		return false
+	}
+	stop()
+	return true
 }
 
 // flushActivePacketWriter flushes any buffered pcapng data to disk. It is safe

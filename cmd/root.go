@@ -84,7 +84,9 @@ func init() {
 
 		// Persist any buffered packet capture data before exiting; os.Exit
 		// skips deferred flushes, which would otherwise truncate the pcapng.
-		flushActivePacketWriter()
+		if !stopActivePacketCapture() {
+			flushActivePacketWriter()
+		}
 
 		os.Exit(0)
 	}()
