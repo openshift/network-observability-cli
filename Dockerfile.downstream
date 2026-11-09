@@ -1,8 +1,7 @@
 ARG BUILDVERSION
 ARG BUILDVERSION_Y
 
-# Build the manager binary
-FROM brew.registry.redhat.io/rh-osbs/openshift-golang-builder:v1.26 AS builder
+FROM registry.redhat.io/openshift/golang-builder:golang-builder-v1.26-rhel9 as builder
 ARG BUILDVERSION
 ARG IMAGE=registry.redhat.io/network-observability/network-observability-cli-rhel9:${BUILDVERSION}
 ARG AGENT_IMAGE=registry.redhat.io/network-observability/network-observability-ebpf-agent-rhel9:${BUILDVERSION}
